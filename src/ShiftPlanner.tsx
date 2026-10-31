@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import ShiftCatalog, { DEFAULT_SHIFT_COLOR, type ShiftTemplate } from './ShiftCatalog.tsx'
 import { deleteGoogleEvent, upsertGoogleEvent } from './googleCalendar.ts'
 import { createTranslator, languageNames, localeByLanguage, translations, type Language } from './translations.ts'
@@ -30,6 +30,8 @@ const LANGUAGE_STORAGE_KEY = 'muszaknaplo-language'
 const THEME_STORAGE_KEY = 'muszaknaplo-theme'
 const GOOGLE_CALENDAR_SCOPE = 'https://www.googleapis.com/auth/calendar.events'
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID?.trim() ?? ''
+
+type AppProps = { userId: string; username: string; onLogout: () => Promise<void>; logoutLabel: string }
 
 function dateKey(date: Date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
@@ -131,10 +133,13 @@ function makeCalendar(shifts: Shift[]) {
   ].map(foldCalendarLine).join('\r\n') + '\r\n'
 }
 
-function App() {
+function App({ userId, username, onLogout, logoutLabel }: AppProps) {
+  const userStorageKey = `${STORAGE_KEY}:${userId}`
+  const userTemplateStorageKey = `${TEMPLATE_STORAGE_KEY}:${userId}`
+  const userGoogleDeleteStorageKey = `${GOOGLE_DELETE_STORAGE_KEY}:${userId}`
   const [shifts, setShifts] = useState<Shift[]>(() => {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY)
+      const saved = localStorage.getItem(userStorageKey)
       if (!saved) return []
       return (JSON.parse(saved) as Array<Partial<Shift> & { role?: string }>).map((shift) => {
         const start = shift.start ?? '09:00'
@@ -158,7 +163,7 @@ function App() {
   })
   const [templates, setTemplates] = useState<ShiftTemplate[]>(() => {
     try {
-      const saved = localStorage.getItem(TEMPLATE_STORAGE_KEY)
+      const saved = localStorage.getItem(userTemplateStorageKey)
       return saved
         ? (JSON.parse(saved) as Array<ShiftTemplate & { color?: string; hours?: number }>).map((template) => ({
             ...template,
@@ -190,7 +195,7 @@ function App() {
   const [googleSyncing, setGoogleSyncing] = useState(false)
   const [deletedGoogleEventIds, setDeletedGoogleEventIds] = useState<string[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem(GOOGLE_DELETE_STORAGE_KEY) ?? '[]') as string[]
+      return JSON.parse(localStorage.getItem(userGoogleDeleteStorageKey) ?? '[]') as string[]
     } catch {
       return []
     }
@@ -205,25 +210,67 @@ function App() {
     date: dateKey(new Date()),
     templateId: templates.find((template) => template.active)?.id ?? '',
   }))
+  const initialState = useRef({ shifts, templates })
 
   useEffect(() => {
     let cancelled = false
     async function loadDatabase() {
       try {
         const response = await fetch('/api/state')
+        if (response.status === 401) {
+          window.dispatchEvent(new Event('muszaknaplo-auth-expired'))
+          throw new Error('Bejelentkezés szükséges.')
+        }
         if (!response.ok) throw new Error('SQLite-adatbázis nem érhető el.')
-        const state = await response.json() as { initialized: boolean; shifts: Shift[]; templates: ShiftTemplate[] }
+        const state = await response.json() as { initialized: boolean; allowLegacyImport: boolean; shifts: Shift[]; templates: ShiftTemplate[] }
         if (cancelled) return
         if (state.initialized) {
           setShifts(state.shifts.map((shift) => ({ ...shift, pauseMinutes: shift.pauseMinutes ?? 0 })))
           setTemplates(state.templates.map((template) => ({ ...template, pauseMinutes: template.pauseMinutes ?? 0 })))
         } else {
+          let shiftsToMigrate = initialState.current.shifts
+          let templatesToMigrate = initialState.current.templates
+          if (state.allowLegacyImport && !localStorage.getItem(userStorageKey)) {
+            const legacyShifts = localStorage.getItem(STORAGE_KEY)
+            const legacyTemplates = localStorage.getItem(TEMPLATE_STORAGE_KEY)
+            if (legacyShifts) {
+              shiftsToMigrate = (JSON.parse(legacyShifts) as Array<Partial<Shift> & { role?: string }>).map((shift) => {
+                const start = shift.start ?? '09:00'
+                const end = shift.end ?? '17:00'
+                const pauseMinutes = shift.pauseMinutes ?? 0
+                return {
+                  ...shift,
+                  start,
+                  end,
+                  pauseMinutes,
+                  name: shift.name ?? shift.role ?? '',
+                  abbreviation: shift.abbreviation ?? '',
+                  color: shift.color ?? DEFAULT_SHIFT_COLOR,
+                  hours: shift.hours ?? durationHours(start, end, pauseMinutes),
+                  countsTowardTotal: shift.countsTowardTotal ?? true,
+                } as Shift
+              })
+            }
+            if (legacyTemplates) {
+              templatesToMigrate = (JSON.parse(legacyTemplates) as Array<ShiftTemplate & { color?: string; hours?: number }>).map((template) => ({
+                ...template,
+                pauseMinutes: template.pauseMinutes ?? 0,
+                color: template.color ?? DEFAULT_SHIFT_COLOR,
+                hours: template.hours ?? durationHours(template.start, template.end, template.pauseMinutes ?? 0),
+                countsTowardTotal: template.countsTowardTotal ?? true,
+                active: template.active ?? true,
+              }))
+            }
+          }
           const migration = await fetch('/api/state', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ shifts, templates }),
+            body: JSON.stringify({ shifts: shiftsToMigrate, templates: templatesToMigrate }),
           })
+          if (migration.status === 401) window.dispatchEvent(new Event('muszaknaplo-auth-expired'))
           if (!migration.ok) throw new Error('A korábbi adatok átvitele nem sikerült.')
+          setShifts(shiftsToMigrate)
+          setTemplates(templatesToMigrate)
         }
         setSqliteAvailable(true)
         setStorageStatus('A műszakok és beosztások SQLite-adatbázisba mentődnek.')
@@ -235,17 +282,17 @@ function App() {
     }
     void loadDatabase()
     return () => { cancelled = true }
-  }, [])
+  }, [userStorageKey])
 
   useEffect(() => {
     if (!storageReady) return
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(shifts))
-  }, [shifts, storageReady])
+    localStorage.setItem(userStorageKey, JSON.stringify(shifts))
+  }, [shifts, storageReady, userStorageKey])
 
   useEffect(() => {
     if (!storageReady) return
-    localStorage.setItem(TEMPLATE_STORAGE_KEY, JSON.stringify(templates))
-  }, [templates, storageReady])
+    localStorage.setItem(userTemplateStorageKey, JSON.stringify(templates))
+  }, [templates, storageReady, userTemplateStorageKey])
 
   useEffect(() => {
     if (!storageReady || !sqliteAvailable) return
@@ -255,6 +302,7 @@ function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ shifts, templates }),
       }).then((response) => {
+        if (response.status === 401) window.dispatchEvent(new Event('muszaknaplo-auth-expired'))
         if (!response.ok) throw new Error('SQLite-mentés sikertelen.')
       }).catch((error: unknown) => {
         setStorageStatus(error instanceof Error ? `${error.message} A böngésző helyi mentése továbbra is aktív.` : 'SQLite-mentés sikertelen.')
@@ -275,8 +323,8 @@ function App() {
   }, [theme])
 
   useEffect(() => {
-    localStorage.setItem(GOOGLE_DELETE_STORAGE_KEY, JSON.stringify(deletedGoogleEventIds))
-  }, [deletedGoogleEventIds])
+    localStorage.setItem(userGoogleDeleteStorageKey, JSON.stringify(deletedGoogleEventIds))
+  }, [deletedGoogleEventIds, userGoogleDeleteStorageKey])
 
   useEffect(() => {
     if (window.google) return
@@ -440,6 +488,10 @@ function App() {
               <button className="google-disconnect" type="button" onClick={disconnectGoogleCalendar} aria-label={t('googleDisconnect')}>×</button>
             </div>
           : <button className="google-button" type="button" onClick={connectGoogleCalendar} disabled={!GOOGLE_CLIENT_ID || !googleReady}>{t('googleConnect')}</button>}
+        <div className="account-actions">
+          <span>{username}</span>
+          <button type="button" onClick={() => { void onLogout() }}>{logoutLabel}</button>
+        </div>
       </header>
 
       {googleStatus && <p className="google-status" role="status" aria-live="polite">{googleStatus}</p>}
@@ -537,7 +589,7 @@ function App() {
         </div>
         </>}
       </main>
-      <footer className="footer-note"><span>Helyi mentés</span><span>·</span><span>Az ICS-fájl az összes felvitt műszakot tartalmazza</span></footer>
+      <footer className="footer-note"><span>{t('footerLocal')}</span><span>·</span><span>{t('footerIcs')}</span></footer>
     </div>
   )
 }

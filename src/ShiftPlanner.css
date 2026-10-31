@@ -63,6 +63,10 @@ button { cursor: pointer; }
 .google-button:disabled { opacity: .5; cursor: not-allowed; }
 .google-actions { display: flex; align-items: center; gap: 5px; }
 .google-disconnect { width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 50%; background: transparent; color: var(--muted); font-size: 18px; }
+.account-actions { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; }
+.account-actions span { max-width: 100px; overflow: hidden; text-overflow: ellipsis; }
+.account-actions button { min-height: 34px; padding: 0 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface); color: var(--ink); font-size: 11px; }
+.account-actions button:hover { background: var(--accent-soft); }
 .google-status { max-width: 1220px; margin: 8px auto 0; padding: 0 56px; color: var(--signal); font-size: 11px; }
 .setup-status { color: var(--muted); }
 .settings-view { min-height: 65vh; }
